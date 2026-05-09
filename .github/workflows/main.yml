@@ -40,6 +40,29 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Cache node_modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            package-lock.json
+          key: npm-packages-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            npm-packages-${{ runner.os }}-
+            npm-packages-
+
+      - name: Cache Chromium
+        id: cache-chromium
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/puppeteer
+            /home/runner/.cache/puppeteer
+          key: chromium-${{ runner.os }}-puppeteer
+          restore-keys: |
+            chromium-${{ runner.os }}-
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
@@ -54,10 +77,25 @@ jobs:
             fonts-freefont-ttf \
             --no-install-recommends 2>/dev/null || true
 
-      - name: Install npm packages
+      - name: Initialize and Install npm packages
+        if: steps.cache-npm.outputs.cache-hit != 'true'
         run: |
-          npm init -y
+          if [ ! -f "package.json" ]; then
+            npm init -y
+          fi
           npm install puppeteer pdf-lib
+
+      - name: Install npm packages (from cache)
+        if: steps.cache-npm.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ استفاده از node_modules کش شده"
+          if [ ! -f "package.json" ]; then
+            npm init -y
+            npm install puppeteer pdf-lib
+          else
+            npm ci || npm install
+          fi
+          ls -la node_modules | head -20
 
       - name: Find Chromium Path
         id: chromium
@@ -77,7 +115,6 @@ jobs:
           const puppeteer = require('puppeteer');
           const { PDFDocument } = require('pdf-lib');
           const fs = require('fs');
-          const path = require('path');
 
           const TARGET_URL = process.env.TARGET_URL;
           const MAX_DEPTH = parseInt(process.env.DEPTH || '2');
@@ -94,9 +131,12 @@ jobs:
             }
           } catch(e) {
             console.error('❌ آدرس وارد شده معتبر نیست');
-            console.error(e.message);
             process.exit(1);
           }
+
+          console.log(`🚀 شروع آرشیو ${TARGET_URL}`);
+          console.log(`🌐 دامنه: ${BASE_DOMAIN}`);
+          console.log(`🔍 عمق: ${MAX_DEPTH}`);
 
           const visited = new Set();
           const pagesToVisit = [{ url: TARGET_URL, depth: 0 }];
@@ -108,57 +148,27 @@ jobs:
               const absolute = new URL(url, base);
               if (absolute.hostname !== BASE_DOMAIN) return null;
               absolute.hash = '';
-              const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'fbclid', 'gclid'];
-              trackingParams.forEach(p => absolute.searchParams.delete(p));
-              let normalized = absolute.href.replace(/\/$/, '');
-              return normalized;
+              ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'fbclid', 'gclid']
+                .forEach(p => absolute.searchParams.delete(p));
+              return absolute.href.replace(/\/$/, '');
             } catch {
               return null;
             }
           }
 
           function isContentPage(url) {
-            const skipExtensions = ['.pdf', '.zip', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.xml', '.rss', '.ico', '.woff', '.woff2', '.mp4', '.webm'];
-            const urlLower = url.toLowerCase();
-            if (skipExtensions.some(ext => urlLower.includes(ext))) return false;
+            const skipExtensions = ['.pdf', '.zip', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.xml', '.ico', '.woff', '.woff2', '.mp4'];
+            if (skipExtensions.some(ext => url.toLowerCase().includes(ext))) return false;
             
             const skipPatterns = [
-              '/login', '/signin', '/register', '/signup', '/search', 
+              '/login', '/signin', '/register', '/signup', '/search',
               '/cart', '/checkout', '/account', '/admin', '/wp-admin',
-              '/cdn-cgi/', '/tag/', '/category/', '/author/', '/feed/',
-              '/wp-json/', '/xmlrpc'
+              '/cdn-cgi/', '/tag/', '/category/', '/author/', '/feed/'
             ];
-            if (skipPatterns.some(pattern => urlLower.includes(pattern))) return false;
-            
-            return true;
-          }
-
-          async function extractLinks(page) {
-            return await page.evaluate(() => {
-              const links = new Set();
-              document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.getAttribute('href');
-                if (href && 
-                    !href.startsWith('#') && 
-                    !href.startsWith('javascript:') && 
-                    !href.startsWith('mailto:') && 
-                    !href.startsWith('tel:') &&
-                    !href.startsWith('data:') &&
-                    href !== '/' &&
-                    href !== '') {
-                  links.add(href);
-                }
-              });
-              return Array.from(links);
-            });
+            return !skipPatterns.some(pattern => url.toLowerCase().includes(pattern));
           }
 
           (async () => {
-            console.log(`🚀 راه‌اندازی مرورگر...`);
-            console.log(`📍 آدرس هدف: ${TARGET_URL}`);
-            console.log(`🔍 عمق خزش: ${MAX_DEPTH}`);
-            console.log(`🌐 دامنه: ${BASE_DOMAIN}`);
-            
             const browser = await puppeteer.launch({
               executablePath: CHROMIUM_PATH,
               headless: 'new',
@@ -169,9 +179,7 @@ jobs:
                 '--disable-gpu',
                 '--disable-extensions',
                 '--disable-background-networking',
-                '--disable-sync',
-                '--no-first-run',
-                '--disable-features=TranslateUI'
+                '--disable-sync'
               ]
             });
 
@@ -180,12 +188,7 @@ jobs:
             while (pagesToVisit.length > 0 && pageCount < MAX_PAGES) {
               const { url, depth } = pagesToVisit.shift();
               
-              if (visited.has(url)) continue;
-              if (depth > MAX_DEPTH) continue;
-              if (!isContentPage(url)) {
-                console.log(`⊘ رد شد: ${url}`);
-                continue;
-              }
+              if (visited.has(url) || depth > MAX_DEPTH || !isContentPage(url)) continue;
               
               visited.add(url);
               pageCount++;
@@ -195,223 +198,114 @@ jobs:
               let page;
               try {
                 page = await browser.newPage();
+                await page.setViewport({ width: 1366, height: 768, deviceScaleFactor: 2 });
                 
-                page.setDefaultNavigationTimeout(30000);
-                page.setDefaultTimeout(30000);
-                
-                await page.setViewport({ 
-                  width: 1366, 
-                  height: 768,
-                  deviceScaleFactor: 2
-                });
-                
-                // User agent فارسی/ایرانی
-                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-                
-                // بلاک کردن منابع غیرضروری
+                // بلاک منابع غیرضروری
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
-                  const resourceType = req.resourceType();
-                  const reqUrl = req.url();
-                  if (resourceType === 'image' || 
-                      resourceType === 'stylesheet' || 
-                      resourceType === 'font' ||
-                      resourceType === 'media' ||
-                      reqUrl.includes('analytics') ||
-                      reqUrl.includes('tracking') ||
-                      reqUrl.includes('doubleclick') ||
-                      reqUrl.includes('googletagmanager') ||
-                      reqUrl.includes('google-analytics') ||
-                      reqUrl.includes('facebook')) {
+                  const type = req.resourceType();
+                  const u = req.url();
+                  if (['image', 'stylesheet', 'font', 'media'].includes(type) ||
+                      u.includes('analytics') || u.includes('tracking') || 
+                      u.includes('doubleclick') || u.includes('googletagmanager')) {
                     req.abort();
                   } else {
                     req.continue();
                   }
                 });
 
-                // لود صفحه با مدیریت خطا
                 try {
-                  await page.goto(url, { 
-                    waitUntil: 'networkidle0', 
-                    timeout: 30000 
-                  });
-                } catch (navError) {
-                  console.log(`⚠️ تلاش مجدد...`);
+                  await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
+                } catch {
                   try {
-                    await page.goto(url, { 
-                      waitUntil: 'domcontentloaded', 
-                      timeout: 30000 
-                    });
-                  } catch (retryError) {
-                    console.log(`⚠️ ادامه با محتوای موجود`);
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                  } catch {
+                    console.log('⚠️ بارگذاری ناقص');
                   }
                 }
 
-                // صبر برای render کامل
-                await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 2000)));
+                await page.evaluate(() => new Promise(r => setTimeout(r, 2000)));
 
-                // حذف عناصر مزاحم
+                // تمیزکاری کامل صفحه
                 await page.evaluate(() => {
-                  // حذف "Skip to content" و موارد مشابه
-                  const skipSelectors = [
+                  // حذف Skip to content
+                  const skipPatterns = [
                     '.skip-link', '.skip-to-content', '.skip-to-main',
                     '.screen-reader-text', '[class*="skip"]',
-                    '.sr-only', '.visually-hidden', '.skip-navigation',
-                    'a[href="#main"]', 'a[href="#content"]', 
-                    'a[href="#main-content"]', '#skiptocontent', '.skiplink',
-                    '.elementor-screen-only', '.screen-reader-shortcut'
+                    '.sr-only', '.visually-hidden', '#skiptocontent'
                   ];
-                  
-                  skipSelectors.forEach(selector => {
-                    try {
-                      document.querySelectorAll(selector).forEach(el => {
-                        const text = el.textContent.toLowerCase();
-                        if (text.includes('skip') || 
-                            text.includes('پرش') ||
-                            text.includes('رد کردن') ||
-                            text.includes('محتوای اصلی') ||
-                            el.classList.contains('skip-link') ||
-                            el.classList.contains('screen-reader-text')) {
-                          el.remove();
-                        }
-                      });
-                    } catch(e) {}
+                  skipPatterns.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => {
+                      if (el.textContent.toLowerCase().includes('skip') || 
+                          el.textContent.includes('پرش')) el.remove();
+                    });
                   });
 
                   // حذف عناصر غیرضروری
-                  const removeSelectors = [
-                    'script', 'style', 'iframe', 'noscript',
-                    'nav', 'header', 'footer',
-                    '.sidebar', '.menu', '.nav', '.navigation',
-                    '.advertisement', '.ad', '.ads',
-                    '.cookie-banner', '.cookie-consent', '.cookie-notice',
-                    '.popup', '.modal', '.overlay',
-                    '.social-share', '.social-links',
-                    '.comments', '#comments',
-                    '.related-posts', '.recommended',
-                    '.search-form', '.search-box',
-                    'form[role="search"]',
-                    '#wpadminbar',
-                    '.gdpr', '.cc-banner',
-                    '.newsletter', '.subscription',
-                    '.back-to-top', '.scroll-to-top',
-                    '[aria-hidden="true"]'
-                  ];
-                  
-                  removeSelectors.forEach(selector => {
-                    try {
-                      document.querySelectorAll(selector).forEach(el => el.remove());
-                    } catch(e) {}
-                  });
+                  'script,style,iframe,nav,header,footer,.sidebar,.menu,.nav,.advertisement,.ad,.ads,.cookie-banner,.popup,.modal,.comments,.social-share,.newsletter,.back-to-top,[aria-hidden="true"]'
+                    .split(',').forEach(sel => {
+                      document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
                 });
 
-                // تولید PDF
                 const pdfBuffer = await page.pdf({
                   format: 'A4',
                   printBackground: true,
-                  margin: { 
-                    top: '20mm', 
-                    bottom: '20mm', 
-                    left: '15mm', 
-                    right: '15mm' 
-                  },
+                  margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
                   displayHeaderFooter: true,
-                  headerTemplate: `
-                    <div style="
-                      font-size: 9px;
-                      font-family: Arial, sans-serif;
-                      text-align: center;
-                      width: 100%;
-                      padding: 8px;
-                      color: #666;
-                      border-bottom: 1px solid #eee;
-                    ">
-                      <span style="font-weight: bold;">${BASE_DOMAIN}</span> - ${new Date().toLocaleDateString('fa-IR')}
-                    </div>
-                  `,
-                  footerTemplate: `
-                    <div style="
-                      font-size: 9px;
-                      font-family: Arial, sans-serif;
-                      text-align: center;
-                      width: 100%;
-                      padding: 8px;
-                      color: #666;
-                      border-top: 1px solid #eee;
-                    ">
-                      <span class="pageNumber"></span> / <span class="totalPages"></span>
-                    </div>
-                  `,
+                  headerTemplate: `<div style="font-size:9px;text-align:center;width:100%;padding:8px;color:#666;border-bottom:1px solid #eee"><b>${BASE_DOMAIN}</b> - ${new Date().toLocaleDateString('fa-IR')}</div>`,
+                  footerTemplate: '<div style="font-size:9px;text-align:center;width:100%;padding:8px;color:#666;border-top:1px solid #eee"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
                   scale: 0.9
                 });
                 
-                const pageTitle = await page.title() || url;
-                pdfBuffers.push({ 
-                  url, 
-                  buffer: pdfBuffer,
-                  title: pageTitle.substring(0, 100)
-                });
-                
-                const sizeKB = (pdfBuffer.length / 1024).toFixed(1);
-                console.log(`✅ ${sizeKB} KB | ${pageTitle}`.substring(0, 120));
+                pdfBuffers.push({ url, buffer: pdfBuffer });
+                console.log(`✅ ${(pdfBuffer.length/1024).toFixed(1)} KB`);
                 
                 await page.close();
-                page = null;
 
-                // استخراج لینک‌ها برای عمق بیشتر
+                // استخراج لینک‌ها
                 if (depth < MAX_DEPTH && pagesToVisit.length < MAX_PAGES * 2) {
-                  const explorePage = await browser.newPage();
+                  const ep = await browser.newPage();
                   try {
-                    await explorePage.setRequestInterception(true);
-                    explorePage.on('request', (req) => {
-                      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                        req.abort();
-                      } else {
-                        req.continue();
-                      }
+                    await ep.setRequestInterception(true);
+                    ep.on('request', (req) => {
+                      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
+                      else req.continue();
                     });
                     
-                    await explorePage.goto(url, { 
-                      waitUntil: 'domcontentloaded', 
-                      timeout: 15000 
+                    await ep.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                    
+                    const links = await ep.evaluate(() => {
+                      const s = new Set();
+                      document.querySelectorAll('a[href]').forEach(a => {
+                        const h = a.getAttribute('href');
+                        if (h && !h.startsWith('#') && !h.startsWith('javascript:') && 
+                            !h.startsWith('mailto:') && !h.startsWith('tel:') && h !== '/') s.add(h);
+                      });
+                      return Array.from(s);
                     });
-                    
-                    const links = await extractLinks(explorePage);
-                    let addedLinks = 0;
-                    
+
+                    let added = 0;
                     for (const link of links) {
-                      const normalized = normalizeUrl(link, url);
-                      if (normalized && !visited.has(normalized) && isContentPage(normalized)) {
-                        const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
-                        if (!alreadyPlanned) {
-                          pagesToVisit.push({ url: normalized, depth: depth + 1 });
-                          addedLinks++;
-                        }
+                      const n = normalizeUrl(link, url);
+                      if (n && !visited.has(n) && isContentPage(n) && 
+                          !pagesToVisit.some(p => p.url === n)) {
+                        pagesToVisit.push({ url: n, depth: depth + 1 });
+                        added++;
                       }
                     }
-                    
-                    if (addedLinks > 0) {
-                      console.log(`🔗 +${addedLinks} لینک جدید (عمق ${depth + 1})`);
-                    }
-                  } catch (e) {
-                    // خطا در استخراج لینک قابل چشم‌پوشی است
-                  }
-                  await explorePage.close();
+                    if (added) console.log(`🔗 +${added} لینک (عمق ${depth + 1})`);
+                  } catch {}
+                  await ep.close();
                 }
-                
               } catch (error) {
-                console.log(`❌ خطا: ${error.message.substring(0, 150)}`);
-                if (page) {
-                  try { await page.close(); } catch(e) {}
-                }
+                console.log(`❌ ${error.message.substring(0, 100)}`);
+                if (page) await page.close().catch(() => {});
               }
             }
 
             await browser.close();
-            console.log(`\n${'='.repeat(50)}`);
-            console.log(`📊 خلاصه:`);
-            console.log(`   صفحات پردازش شده: ${pageCount}`);
-            console.log(`   PDF‌های تولید شده: ${pdfBuffers.length}`);
+            console.log(`\n📊 ${pdfBuffers.length} صفحه دریافت شد`);
 
             if (pdfBuffers.length === 0) {
               console.error('❌ هیچ صفحه‌ای دریافت نشد!');
@@ -419,125 +313,68 @@ jobs:
             }
 
             // ادغام PDFها
-            console.log(`\n📚 در حال ادغام ${pdfBuffers.length} فایل PDF...`);
+            console.log('📚 ادغام PDFها...');
             const mergedPdf = await PDFDocument.create();
-            let mergedCount = 0;
-
-            for (const { url, buffer, title } of pdfBuffers) {
+            
+            for (const { url, buffer } of pdfBuffers) {
               try {
-                const singlePdf = await PDFDocument.load(buffer);
-                const copiedPages = await mergedPdf.copyPages(singlePdf, singlePdf.getPageIndices());
-                copiedPages.forEach(page => mergedPdf.addPage(page));
-                mergedCount++;
-              } catch (error) {
+                const single = await PDFDocument.load(buffer);
+                const pages = await mergedPdf.copyPages(single, single.getPageIndices());
+                pages.forEach(p => mergedPdf.addPage(p));
+              } catch (e) {
                 console.log(`⚠️ خطا در ادغام: ${url}`);
               }
             }
 
-            if (mergedCount === 0) {
-              console.error('❌ ادغام PDFها شکست خورد');
-              process.exit(1);
-            }
-
-            // ذخیره فایل نهایی
             const pdfBytes = await mergedPdf.save();
-            
-            // ذخیره در ریشه ریپو
             fs.writeFileSync(OUTPUT_FILE, pdfBytes);
             
             const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(2);
-            console.log(`\n${'='.repeat(50)}`);
-            console.log(`✅ فایل نهایی ذخیره شد`);
-            console.log(`📁 ${OUTPUT_FILE}`);
-            console.log(`📦 حجم: ${sizeMB} MB`);
-            console.log(`📄 صفحات PDF: ${mergedPdf.getPageCount()}`);
+            console.log(`\n✅ ${OUTPUT_FILE} | ${sizeMB} MB | ${mergedPdf.getPageCount()} صفحه`);
             
           })().catch(err => {
-            console.error('❌ خطای بحرانی:', err);
+            console.error('❌ خطا:', err);
             process.exit(1);
           });
           SCRIPT_END
 
-          echo "🚀 شروع آرشیو..."
           node archive.js
 
-      - name: Commit PDF to Repository
+      - name: Push PDF to Repository
         if: success()
         run: |
           FILENAME="${{ github.event.inputs.filename }}.pdf"
           
-          echo "📋 بررسی فایل: $FILENAME"
-          
-          # بررسی وجود فایل
           if [ ! -f "$FILENAME" ]; then
-            echo "❌ فایل PDF یافت نشد!"
-            echo "📂 محتویات پوشه جاری:"
-            ls -la
+            echo "❌ فایل PDF یافت نشد"
             exit 1
           fi
           
-          echo "✅ فایل PDF پیدا شد"
-          ls -lh "$FILENAME"
+          # اضافه کردن فایل PDF به ریپو
+          git add "$FILENAME"
           
-          # نمایش محتوای پوشه
-          echo "📂 فایل‌های موجود:"
-          ls -la
+          # اضافه کردن package.json و package-lock.json برای کش
+          if [ -f "package.json" ]; then
+            git add package.json
+          fi
+          if [ -f "package-lock.json" ]; then
+            git add package-lock.json
+          fi
           
-      - name: Push to Repository
-        if: success()
-        run: |
-          FILENAME="${{ github.event.inputs.filename }}.pdf"
-          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-          DOMAIN=$(echo "${{ github.event.inputs.target_url }}" | sed 's|https\?://||' | sed 's|/.*||')
-          
-          echo "🔄 آماده‌سازی برای commit و push..."
-          
-          # تنظیم git
+          # تنظیمات git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # ایجاد شاخه جدید برای این آرشیو
-          BRANCH_NAME="pdf-archive-${DOMAIN}-${TIMESTAMP}"
-          
-          # ایجاد و سوییچ به شاخه جدید
-          git checkout -b "$BRANCH_NAME"
-          
-          # اضافه کردن فایل PDF
-          git add "$FILENAME"
-          
-          # نمایش وضعیت
-          echo "📊 وضعیت git:"
-          git status
-          
           # کامیت
-          git commit -m "📚 آرشیو PDF: ${{ github.event.inputs.target_url }}" \
-                     -m "🔍 عمق: ${{ github.event.inputs.depth }}" \
-                     -m "📅 تاریخ: ${TIMESTAMP}" || {
-            echo "⚠️ خطا در commit"
-            git status
-          }
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          git commit -m "📚 PDF Archive: ${{ github.event.inputs.target_url }} ($TIMESTAMP)" || echo "بدون تغییر"
           
-          # Push به شاخه جدید
-          echo "📤 در حال push به شاخه ${BRANCH_NAME}..."
-          git push origin "$BRANCH_NAME"
+          # Pull و Push
+          git pull --rebase origin ${{ github.ref_name }}
+          git push origin ${{ github.ref_name }}
           
-          # ایجاد Pull Request (اختیاری)
-          echo "🔗 لینک دانلود مستقیم:"
-          echo "https://github.com/${{ github.repository }}/raw/${BRANCH_NAME}/${FILENAME}"
+          echo "✅ فایل در ریپو ذخیره شد"
+          echo "📥 https://github.com/${{ github.repository }}/blob/main/$FILENAME"
           
-          # همچنین push به main
-          echo "🔄 در حال merge با main..."
-          git checkout main
-          git pull origin main
-          git merge "$BRANCH_NAME" --no-edit
-          git push origin main
-          
-          echo "✅ فایل PDF با موفقیت در ریپو ذخیره شد!"
-          echo ""
-          echo "📥 لینک دانلود مستقیم:"
-          echo "https://github.com/${{ github.repository }}/raw/main/${FILENAME}"
-          
-          # نمایش اطلاعات فایل
-          echo ""
-          echo "📊 اطلاعات فایل:"
+          # نمایش حجم فایل
           ls -lh "$FILENAME"
