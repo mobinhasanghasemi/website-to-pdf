@@ -1,96 +1,135 @@
-name: Website to PDF Archive
+name: Website Archiver
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'آدرس سایت (مثال: https://example.com)'
+        description: '🌐 آدرس سایت'
         required: true
         type: string
+        default: 'https://example.com'
       depth:
-        description: 'عمق دنبال کردن لینک‌ها (1 = فقط صفحه اصلی)'
+        description: '🔍 عمق خزیدن (عمق ۱ = فقط صفحه اصلی)'
         required: false
         type: choice
-        options:
-          - '1'
-          - '2'
-          - '3'
+        options: ['1', '2', '3']
         default: '2'
-      filename:
-        description: 'نام فایل PDF خروجی'
+      content_selector:
+        description: '🎯 سلکتور CSS برای محتوای اصلی (خالی = کل صفحه)'
         required: false
         type: string
-        default: 'web-archive'
+        default: ''
+      extract_text_only:
+        description: '📝 فقط متن را استخراج کن (حذف کامل کدهای اضافه)'
+        required: false
+        type: boolean
+        default: false
+      telegram_token:
+        description: '🤖 توکن ربات تلگرام (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      telegram_chat_id:
+        description: '💬 Chat ID تلگرام (اختیاری)'
+        required: false
+        type: string
+        default: ''
+      filename:
+        description: '📁 نام فایل خروجی'
+        required: false
+        type: string
+        default: 'archive'
 
 jobs:
-  archive-to-pdf:
-    name: Archive Website as PDF
+  archive:
+    name: 📚 Archive Website
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    timeout-minutes: 300
 
     steps:
-      - name: Checkout Repository
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: 🟢 Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install System Dependencies
+      - name: 🔧 Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            chromium-browser \
-            fonts-ipafont-gothic \
-            fonts-wqy-zenhei \
-            fonts-thai-tlwg \
-            fonts-kacst \
-            fonts-freefont-ttf \
-            --no-install-recommends || true
+          sudo apt-get install -y -qq chromium-browser --no-install-recommends || true
 
-      - name: Install npm packages
+      - name: 📦 Install npm Packages
         run: |
           npm init -y
-          npm install puppeteer pdf-lib
+          npm install puppeteer pdf-lib sharp
 
-      - name: Find Chromium Path
+      - name: 🔍 Find Chromium
         id: chromium
         run: |
-          CHROMIUM_PATH=$(which chromium-browser || which chromium || which google-chrome || echo "/usr/bin/chromium-browser")
+          CHROMIUM_PATH=$(which chromium-browser || which chromium || echo "/usr/bin/chromium-browser")
           echo "path=$CHROMIUM_PATH" >> $GITHUB_OUTPUT
-          echo "Chromium found at: $CHROMIUM_PATH"
 
-      - name: Archive Website to PDF
+      - name: 🕷️ Advanced Archive Script
         env:
           TARGET_URL: ${{ github.event.inputs.target_url }}
           DEPTH: ${{ github.event.inputs.depth }}
-          OUTPUT_FILE: ${{ github.event.inputs.filename }}.pdf
+          CONTENT_SELECTOR: ${{ github.event.inputs.content_selector }}
+          EXTRACT_TEXT_ONLY: ${{ github.event.inputs.extract_text_only }}
+          OUTPUT_FILE: ${{ github.event.inputs.filename }}
           CHROMIUM_PATH: ${{ steps.chromium.outputs.path }}
+          TELEGRAM_TOKEN: ${{ github.event.inputs.telegram_token }}
+          TELEGRAM_CHAT_ID: ${{ github.event.inputs.telegram_chat_id }}
         run: |
-          cat > archive.js << 'SCRIPT_END'
+          cat > advanced-archive.js << 'SCRIPTEND'
           const puppeteer = require('puppeteer');
-          const { PDFDocument } = require('pdf-lib');
+          const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
           const fs = require('fs');
-
-          const TARGET_URL = process.env.TARGET_URL;
-          const MAX_DEPTH = parseInt(process.env.DEPTH || '2');
-          const OUTPUT_FILE = process.env.OUTPUT_FILE || 'web-archive.pdf';
-          const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
+          const path = require('path');
           
+          // تنظیمات
+          const CONFIG = {
+            targetUrl: process.env.TARGET_URL,
+            depth: parseInt(process.env.DEPTH || '2'),
+            contentSelector: process.env.CONTENT_SELECTOR || '',
+            extractTextOnly: process.env.EXTRACT_TEXT_ONLY === 'true',
+            outputFile: process.env.OUTPUT_FILE || 'archive',
+            chromiumPath: process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser',
+            telegramToken: process.env.TELEGRAM_TOKEN || '',
+            telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
+            maxPages: 100,
+            viewport: { width: 1366, height: 768 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          };
+
+          // متغیرهای global
+          const stats = {
+            startTime: Date.now(),
+            totalPages: 0,
+            successPages: 0,
+            failedPages: 0,
+            brokenLinks: [],
+            totalSize: 0,
+            tocEntries: []
+          };
+
+          const visited = new Set();
+          const pagesToVisit = [{ url: CONFIG.targetUrl, depth: 0 }];
+          const pdfBuffers = [];
           let BASE_DOMAIN;
+
+          // اعتبارسنجی URL
           try {
-            BASE_DOMAIN = new URL(TARGET_URL).hostname;
+            BASE_DOMAIN = new URL(CONFIG.targetUrl).hostname;
           } catch(e) {
-            console.error('❌ آدرس وارد شده معتبر نیست');
+            console.error('❌ آدرس نامعتبر است');
             process.exit(1);
           }
 
-          const visited = new Set();
-          const pagesToVisit = [{ url: TARGET_URL, depth: 0 }];
-          const pdfBuffers = [];
-
+          // نرمال‌سازی URL
           function normalizeUrl(url, base) {
             try {
               const absolute = new URL(url, base);
@@ -103,173 +142,460 @@ jobs:
             }
           }
 
-          async function extractLinks(page, baseUrl) {
-            return await page.evaluate(() => {
+          // استخراج لینک‌ها
+          async function extractLinks(page) {
+            return await page.evaluate((selector) => {
+              const container = selector ? document.querySelector(selector) : document;
+              if (!container) return [];
+              
               const links = [];
-              document.querySelectorAll('a[href]').forEach(a => {
+              const anchors = container.querySelectorAll('a[href]');
+              anchors.forEach(a => {
                 const href = a.getAttribute('href');
                 if (href && !href.startsWith('#') && !href.startsWith('javascript:') && 
-                    !href.startsWith('mailto:') && !href.startsWith('tel:')) {
-                  links.push(href);
+                    !href.startsWith('mailto:') && !href.startsWith('tel:') && !href.startsWith('data:')) {
+                  links.push({
+                    url: href,
+                    text: a.textContent.trim().substring(0, 100)
+                  });
                 }
               });
               return links;
+            }, CONFIG.contentSelector);
+          }
+
+          // تشخیص زبان صفحه
+          async function detectLanguage(page) {
+            return await page.evaluate(() => {
+              const lang = document.documentElement.lang || 
+                          document.querySelector('meta[http-equiv="Content-Language"]')?.content ||
+                          'en';
+              return lang.substring(0, 2);
             });
           }
 
-          (async () => {
-            console.log(`🚀 راه‌اندازی مرورگر از مسیر: ${CHROMIUM_PATH}`);
+          // ارسال به تلگرام
+          async function sendToTelegram(message, filePath = null) {
+            if (!CONFIG.telegramToken || !CONFIG.telegramChatId) return;
             
+            const https = require('https');
+            const apiUrl = `https://api.telegram.org/bot${CONFIG.telegramToken}`;
+            
+            try {
+              // ارسال پیام
+              await new Promise((resolve, reject) => {
+                const url = `${apiUrl}/sendMessage?chat_id=${CONFIG.telegramChatId}&text=${encodeURIComponent(message)}&parse_mode=HTML`;
+                https.get(url, (res) => resolve()).on('error', reject);
+              });
+              
+              // ارسال فایل اگر وجود دارد
+              if (filePath && fs.existsSync(filePath)) {
+                const FormData = require('form-data');
+                const form = new FormData();
+                form.append('chat_id', CONFIG.telegramChatId);
+                form.append('document', fs.createReadStream(filePath));
+                
+                // استفاده از fetch برای آپلود
+                const fetch = require('node-fetch');
+                await fetch(`${apiUrl}/sendDocument`, {
+                  method: 'POST',
+                  body: form
+                });
+              }
+              console.log('📤 ارسال به تلگرام موفقیت‌آمیز بود');
+            } catch (e) {
+              console.log('⚠️ خطا در ارسال به تلگرام:', e.message);
+            }
+          }
+
+          // فشرده‌سازی PDF
+          async function compressPdf(pdfBytes) {
+            const pdfDoc = await PDFDocument.load(pdfBytes);
+            // حذف metadata غیرضروری
+            pdfDoc.setTitle('');
+            pdfDoc.setAuthor('');
+            pdfDoc.setSubject('');
+            pdfDoc.setCreator('GitHub Actions Archiver');
+            return await pdfDoc.save({
+              useObjectStreams: true,
+              addDefaultPage: false
+            });
+          }
+
+          // 🚀 اجرای اصلی
+          (async () => {
+            console.log('🚀 شروع فرآیند آرشیو پیشرفته');
+            console.log(`🌐 URL هدف: ${CONFIG.targetUrl}`);
+            console.log(`🔍 عمق خزیدن: ${CONFIG.depth}`);
+            console.log(`📁 نام خروجی: ${CONFIG.outputFile}`);
+            console.log('─'.repeat(50));
+
+            // راه‌اندازی مرورگر
             const browser = await puppeteer.launch({
-              executablePath: CHROMIUM_PATH,
+              executablePath: CONFIG.chromiumPath,
               headless: 'new',
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-extensions'
-              ]
+              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
             });
 
-            let pageCount = 0;
-            const maxPages = 50; // محدودیت برای جلوگیری از timeout
+            let pageIndex = 0;
 
-            while (pagesToVisit.length > 0 && pageCount < maxPages) {
+            // خزیدن صفحات
+            while (pagesToVisit.length > 0 && pageIndex < CONFIG.maxPages) {
               const { url, depth } = pagesToVisit.shift();
               
-              if (visited.has(url)) continue;
-              if (depth > MAX_DEPTH) continue;
+              if (visited.has(url) || depth > CONFIG.depth) continue;
               
               visited.add(url);
-              pageCount++;
+              pageIndex++;
+              stats.totalPages++;
               
-              console.log(`\n📄 [${pageCount}/${maxPages}] دریافت: ${url}`);
+              console.log(`\n📄 [${pageIndex}] ${url}`);
               
               try {
                 const page = await browser.newPage();
-                await page.setViewport({ width: 1280, height: 800 });
-                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                await page.setViewport(CONFIG.viewport);
+                await page.setUserAgent(CONFIG.userAgent);
                 
-                await page.goto(url, { 
+                // رفتن به صفحه
+                const response = await page.goto(url, { 
                   waitUntil: 'networkidle0', 
-                  timeout: 25000 
-                }).catch(() => {
-                  console.log('⚠️ بارگذاری کامل صفحه ممکن نشد، ادامه با محتوای موجود...');
+                  timeout: 30000 
                 });
 
-                // کمی صبر برای لود کامل
-                await new Promise(r => setTimeout(r, 2000));
+                if (!response || response.status() >= 400) {
+                  stats.brokenLinks.push({ url, status: response?.status() || 'failed' });
+                  throw new Error(`HTTP ${response?.status()}`);
+                }
 
-                await page.evaluate(() => {
-                  const removables = 'script, style, iframe, nav, .sidebar, .menu, .nav, .advertisement, .cookie-banner, .popup, .modal, [role="navigation"]';
-                  document.querySelectorAll(removables).forEach(el => el.remove());
-                });
+                await new Promise(r => setTimeout(r, 1500));
 
+                // تشخیص زبان
+                const lang = await detectLanguage(page);
+                console.log(`🔤 زبان تشخیص داده شده: ${lang}`);
+
+                // تنظیم فونت بر اساس زبان
+                await page.evaluate((language) => {
+                  if (language === 'fa' || language === 'ar') {
+                    document.body.style.fontFamily = "'Vazir', 'Tahoma', 'Arial', sans-serif";
+                    document.body.style.direction = 'rtl';
+                  }
+                }, lang);
+
+                // استخراج متن در صورت نیاز
+                if (CONFIG.extractTextOnly) {
+                  await page.evaluate((selector) => {
+                    const container = selector ? document.querySelector(selector) : document.body;
+                    if (container) {
+                      // حذف المان‌های غیرمتنی
+                      const removeSelectors = 'script, style, iframe, img, video, audio, svg, nav, footer, .nav, .menu, .sidebar, .advertisement, .cookie-banner';
+                      container.querySelectorAll(removeSelectors).forEach(el => el.remove());
+                    }
+                  }, CONFIG.contentSelector);
+                }
+
+                // گرفتن PDF
                 const pdfBuffer = await page.pdf({
                   format: 'A4',
                   printBackground: true,
-                  margin: { top: '15mm', bottom: '15mm', left: '10mm', right: '10mm' },
+                  margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
                   displayHeaderFooter: true,
-                  headerTemplate: '<div style="font-size:8px; text-align:center; width:100%; padding:5px;">' + url.substring(0, 100) + '</div>',
-                  footerTemplate: '<div style="font-size:8px; text-align:center; width:100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>'
+                  headerTemplate: `<div style="font-size:8px; text-align:center; padding:5px; color:#666;">${url.substring(0, 80)}</div>`,
+                  footerTemplate: `<div style="font-size:8px; text-align:center; padding:5px; color:#666;">صفحه <span class="pageNumber"></span> از <span class="totalPages"></span> | ${new Date().toISOString().split('T')[0]}</div>`
+                });
+
+                pdfBuffers.push({ 
+                  url, 
+                  buffer: pdfBuffer, 
+                  title: await page.title(),
+                  lang,
+                  pageCount: null // بعداً محاسبه می‌شود
                 });
                 
-                pdfBuffers.push({ url, buffer: pdfBuffer });
-                console.log(`✅ ذخیره شد (${(pdfBuffer.length/1024).toFixed(1)} KB)`);
+                stats.successPages++;
+                stats.totalSize += pdfBuffer.length;
                 
+                console.log(`✅ ذخیره شد (${(pdfBuffer.length/1024).toFixed(1)} KB) - ${await page.title()}`);
+
+                // ذخیره HTML خام
+                if (pageIndex === 1) {
+                  const html = await page.content();
+                  fs.writeFileSync(`${CONFIG.outputFile}_original.html`, html);
+                  console.log('💾 HTML اصلی ذخیره شد');
+                }
+
                 await page.close();
 
-                if (depth < MAX_DEPTH) {
-                  const explorePage = await browser.newPage();
+                // استخراج لینک‌ها برای عمق بیشتر
+                if (depth < CONFIG.depth) {
+                  const linkPage = await browser.newPage();
                   try {
-                    await explorePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
-                    const links = await extractLinks(explorePage, url);
+                    await linkPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+                    const links = await extractLinks(linkPage);
                     
+                    let addedLinks = 0;
                     for (const link of links) {
-                      const normalized = normalizeUrl(link, url);
+                      const normalized = normalizeUrl(link.url, url);
                       if (normalized && !visited.has(normalized)) {
-                        const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
-                        if (!alreadyPlanned) {
+                        const exists = pagesToVisit.some(p => p.url === normalized);
+                        if (!exists) {
                           pagesToVisit.push({ url: normalized, depth: depth + 1 });
+                          addedLinks++;
                         }
                       }
                     }
-                    console.log(`🔗 ${links.length} لینک پیدا شد`);
+                    if (addedLinks > 0) {
+                      console.log(`🔗 ${addedLinks} لینک جدید به صف اضافه شد`);
+                    }
                   } catch (e) {
                     console.log('⚠️ خطا در استخراج لینک‌ها');
                   }
-                  await explorePage.close();
+                  await linkPage.close();
                 }
-                
+
               } catch (error) {
-                console.log(`❌ خطا: ${error.message.substring(0, 100)}`);
+                stats.failedPages++;
+                console.log(`❌ خطا: ${error.message.substring(0, 150)}`);
               }
             }
 
             await browser.close();
-            console.log(`\n📊 مجموع صفحات دریافت شده: ${pdfBuffers.length}`);
 
+            // بررسی موفقیت
             if (pdfBuffers.length === 0) {
-              console.error('❌ هیچ صفحه‌ای دریافت نشد!');
+              console.error('❌ هیچ صفحه‌ای آرشیو نشد!');
               process.exit(1);
             }
 
-            console.log('📚 در حال ادغام PDFها...');
+            // 📚 ادغام PDFها با فهرست مطالب
+            console.log('\n📚 در حال ساخت PDF نهایی با فهرست مطالب...');
             const mergedPdf = await PDFDocument.create();
+            const helveticaFont = await mergedPdf.embedFont(StandardFonts.Helvetica);
+            const helveticaBold = await mergedPdf.embedFont(StandardFonts.HelveticaBold);
 
-            for (const { url, buffer } of pdfBuffers) {
+            // صفحه جلد
+            const coverPage = mergedPdf.addPage();
+            const { width, height } = coverPage.getSize();
+            
+            coverPage.drawText(`📚 آرشیو وب‌سایت`, {
+              x: 50, y: height - 100,
+              size: 28,
+              font: helveticaBold,
+              color: rgb(0.1, 0.1, 0.4)
+            });
+            
+            coverPage.drawText(`URL: ${CONFIG.targetUrl}`, {
+              x: 50, y: height - 140,
+              size: 12,
+              font: helveticaFont,
+              color: rgb(0.3, 0.3, 0.3)
+            });
+            
+            coverPage.drawText(`تاریخ: ${new Date().toLocaleDateString('fa-IR')}`, {
+              x: 50, y: height - 160,
+              size: 12,
+              font: helveticaFont
+            });
+            
+            coverPage.drawText(`تعداد صفحات: ${pdfBuffers.length}`, {
+              x: 50, y: height - 180,
+              size: 12,
+              font: helveticaFont
+            });
+
+            // صفحه فهرست مطالب
+            const tocPage = mergedPdf.addPage();
+            let tocY = height - 80;
+            
+            tocPage.drawText('📑 فهرست مطالب', {
+              x: 50, y: height - 50,
+              size: 22,
+              font: helveticaBold,
+              color: rgb(0.1, 0.1, 0.4)
+            });
+            
+            tocPage.drawText('─'.repeat(80), {
+              x: 50, y: height - 70,
+              size: 10,
+              font: helveticaFont,
+              color: rgb(0.5, 0.5, 0.5)
+            });
+
+            // ادغام صفحات
+            const tocEntries = [];
+            for (let i = 0; i < pdfBuffers.length; i++) {
+              const { url, buffer, title } = pdfBuffers[i];
+              
               try {
                 const singlePdf = await PDFDocument.load(buffer);
-                const copiedPages = await mergedPdf.copyPages(singlePdf, singlePdf.getPageIndices());
-                copiedPages.forEach(page => mergedPdf.addPage(page));
+                const pages = await mergedPdf.copyPages(singlePdf, singlePdf.getPageIndices());
+                
+                const startPage = mergedPdf.getPageCount();
+                pages.forEach(page => mergedPdf.addPage(page));
+                
+                // اضافه به فهرست
+                const entry = {
+                  title: title || url,
+                  url: url,
+                  page: startPage
+                };
+                tocEntries.push(entry);
+                
+                // نوشتن در صفحه فهرست
+                if (tocY > 50) {
+                  const displayTitle = (i + 1) + '. ' + (title || url).substring(0, 70);
+                  tocPage.drawText(displayTitle, {
+                    x: 50, y: tocY,
+                    size: 10,
+                    font: helveticaFont,
+                    color: rgb(0, 0, 0.8)
+                  });
+                  tocPage.drawText(`ص ${startPage}`, {
+                    x: width - 80, y: tocY,
+                    size: 10,
+                    font: helveticaFont,
+                    color: rgb(0.3, 0.3, 0.3)
+                  });
+                  tocY -= 18;
+                }
+
+                console.log(`📄 ادغام: ${title?.substring(0, 50)} | صفحات: ${pages.length}`);
               } catch (error) {
-                console.log(`⚠️ خطا در ادغام: ${url}`);
+                console.log(`⚠️ خطا در ادغام ${url}: ${error.message}`);
               }
             }
 
-            const pdfBytes = await mergedPdf.save();
-            fs.writeFileSync(OUTPUT_FILE, pdfBytes);
+            // ذخیره PDF نهایی
+            console.log('🗜️ فشرده‌سازی PDF...');
+            let finalPdf = await mergedPdf.save({ useObjectStreams: true });
+            fs.writeFileSync(`${CONFIG.outputFile}.pdf`, finalPdf);
             
-            const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(2);
-            console.log(`\n✅ فایل نهایی: ${OUTPUT_FILE}`);
-            console.log(`📦 حجم: ${sizeMB} MB`);
-            console.log(`📄 صفحات: ${pdfBuffers.length}`);
+            // محاسبه آمار نهایی
+            const endTime = Date.now();
+            const duration = Math.round((endTime - stats.startTime) / 1000);
+            const finalSize = (finalPdf.length / (1024 * 1024)).toFixed(2);
+            
+            // گزارش نهایی
+            const report = `
+          ╔══════════════════════════════════╗
+          ║     📊 گزارش نهایی آرشیو       ║
+          ╠══════════════════════════════════╣
+          ║ ⏱️  زمان: ${duration} ثانیه
+          ║ 📄 صفحات موفق: ${stats.successPages}
+          ║ ❌ صفحات ناموفق: ${stats.failedPages}
+          ║ 🔗 لینک‌های شکسته: ${stats.brokenLinks.length}
+          ║ 💾 حجم نهایی: ${finalSize} MB
+          ║ 📁 فایل: ${CONFIG.outputFile}.pdf
+          ╚══════════════════════════════════╝
+            `;
+            
+            console.log(report);
+            
+            // ذخیره گزارش
+            const reportObj = {
+              date: new Date().toISOString(),
+              targetUrl: CONFIG.targetUrl,
+              depth: CONFIG.depth,
+              stats: {
+                duration,
+                totalPages: stats.totalPages,
+                successPages: stats.successPages,
+                failedPages: stats.failedPages,
+                brokenLinks: stats.brokenLinks,
+                finalSize: finalSize + ' MB',
+                outputFile: CONFIG.outputFile + '.pdf'
+              },
+              toc: tocEntries
+            };
+            
+            fs.writeFileSync(
+              `${CONFIG.outputFile}_report.json`, 
+              JSON.stringify(reportObj, null, 2)
+            );
+            
+            // ارسال به تلگرام
+            if (CONFIG.telegramToken) {
+              await sendToTelegram(
+                `✅ آرشیو کامل شد\n📄 ${stats.successPages} صفحه\n💾 حجم: ${finalSize} MB\n🔗 ${CONFIG.targetUrl}`,
+                `${CONFIG.outputFile}.pdf`
+              );
+            }
+            
+            console.log('\n✨ عملیات با موفقیت به پایان رسید!');
+            
           })().catch(err => {
-            console.error('❌ خطای کلی:', err);
+            console.error('❌ خطای بحرانی:', err);
             process.exit(1);
           });
-          SCRIPT_END
+          SCRIPTEND
 
-          echo "شروع آرشیو..."
-          node archive.js
+          echo "شروع اسکریپت..."
+          node advanced-archive.js
 
-      - name: Upload PDF Artifact
+      - name: 📦 Create Screenshot
+        continue-on-error: true
+        run: |
+          cat > screenshot.js << 'EOF'
+          const puppeteer = require('puppeteer');
+          const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
+          
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath: CHROMIUM_PATH,
+              headless: 'new',
+              args: ['--no-sandbox']
+            });
+            const page = await browser.newPage();
+            await page.setViewport({ width: 1366, height: 768 });
+            await page.goto('${{ github.event.inputs.target_url }}', { 
+              waitUntil: 'networkidle2',
+              timeout: 30000 
+            });
+            await page.screenshot({ 
+              path: '${{ github.event.inputs.filename }}_screenshot.png',
+              fullPage: true 
+            });
+            await browser.close();
+            console.log('📸 اسکرین‌شات ذخیره شد');
+          })();
+          EOF
+          node screenshot.js
+
+      - name: 📤 Upload All Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.event.inputs.filename }}
-          path: ${{ github.event.inputs.filename }}.pdf
+          name: ${{ github.event.inputs.filename }}-package
+          path: |
+            ${{ github.event.inputs.filename }}.pdf
+            ${{ github.event.inputs.filename }}_report.json
+            ${{ github.event.inputs.filename }}_screenshot.png
+            ${{ github.event.inputs.filename }}_original.html
           retention-days: 90
 
-      - name: Commit to Repository
+      - name: 💾 Commit to Repository
         if: success()
         run: |
-          FILENAME="${{ github.event.inputs.filename }}.pdf"
+          mkdir -p archives/${{ github.event.inputs.filename }}
           
-          if [ ! -f "$FILENAME" ]; then
-            echo "❌ فایل PDF یافت نشد"
-            exit 1
-          fi
-          
-          mkdir -p archives
-          cp "$FILENAME" "archives/$FILENAME"
+          # کپی همه فایل‌ها
+          cp ${{ github.event.inputs.filename }}.pdf archives/${{ github.event.inputs.filename }}/ 2>/dev/null || true
+          cp ${{ github.event.inputs.filename }}_report.json archives/${{ github.event.inputs.filename }}/ 2>/dev/null || true
+          cp ${{ github.event.inputs.filename }}_screenshot.png archives/${{ github.event.inputs.filename }}/ 2>/dev/null || true
+          cp ${{ github.event.inputs.filename }}_original.html archives/${{ github.event.inputs.filename }}/ 2>/dev/null || true
           
           git config user.name "github-actions[bot]"
           git config user.email "actions@github.com"
-          git add "archives/$FILENAME"
+          git add archives/
           
-          git commit -m "📚 ذخیره PDF: ${{ github.event.inputs.target_url }} ($(date +%Y-%m-%d_%H:%M))" || echo "بدون تغییر جدید"
+          git commit -m "📚 آرشیو: ${{ github.event.inputs.target_url }} ($(date +%Y-%m-%d))" || echo "بدون تغییر جدید"
           git pull --rebase origin main
           git push origin main
           
-          echo "✅ فایل در archives/$FILENAME ذخیره شد"
+          echo "✅ همه فایل‌ها در archives/${{ github.event.inputs.filename }}/ ذخیره شدند"
+
+      - name: 📊 Summary
+        run: |
+          echo "## 📚 آرشیو کامل شد! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "**URL:** ${{ github.event.inputs.target_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**فایل:** ${{ github.event.inputs.filename }}.pdf" >> $GITHUB_STEP_SUMMARY
+          echo "**مسیر:** archives/${{ github.event.inputs.filename }}/" >> $GITHUB_STEP_SUMMARY
+          echo "📥 برای دانلود به بخش Artifacts مراجعه کنید" >> $GITHUB_STEP_SUMMARY
