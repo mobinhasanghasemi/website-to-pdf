@@ -38,15 +38,40 @@ jobs:
 
       - name: 🔧 Install Dependencies
         run: |
+          echo "Updating apt..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq chromium-browser --no-install-recommends || true
-          npm init -y
-          npm install puppeteer pdf-lib
+          echo "Installing chromium..."
+          sudo apt-get install -y -qq chromium-browser --no-install-recommends 2>&1 | tail -5
+          echo "Checking chromium..."
+          which chromium-browser || echo "Chromium not found in PATH"
+          ls -la /usr/bin/chromium* 2>/dev/null || echo "No chromium binaries found"
+          echo "Installing npm packages..."
+          npm init -y 2>&1 | tail -1
+          npm install puppeteer pdf-lib 2>&1 | tail -5
+          echo "Dependencies installed successfully"
 
       - name: 🔍 Find Chromium
         id: chromium
         run: |
-          CHROMIUM_PATH=$(which chromium-browser || echo "/usr/bin/chromium-browser")
+          if which chromium-browser > /dev/null 2>&1; then
+            CHROMIUM_PATH=$(which chromium-browser)
+          elif which chromium > /dev/null 2>&1; then
+            CHROMIUM_PATH=$(which chromium)
+          elif [ -f "/usr/bin/chromium-browser" ]; then
+            CHROMIUM_PATH="/usr/bin/chromium-browser"
+          elif [ -f "/usr/bin/chromium" ]; then
+            CHROMIUM_PATH="/usr/bin/chromium"
+          else
+            echo "Trying to find chromium..."
+            CHROMIUM_PATH=$(find /usr -name "chromium*" -type f 2>/dev/null | head -1)
+          fi
+          
+          if [ -z "$CHROMIUM_PATH" ]; then
+            echo "❌ Chromium not found!"
+            exit 1
+          fi
+          
+          echo "Found chromium at: $CHROMIUM_PATH"
           echo "path=$CHROMIUM_PATH" >> $GITHUB_OUTPUT
 
       - name: 🕷️ Archive Website
@@ -56,39 +81,81 @@ jobs:
           OUTPUT_FILE: ${{ github.event.inputs.filename }}
           CHROMIUM_PATH: ${{ steps.chromium.outputs.path }}
         run: |
+          echo "Starting archive process..."
+          echo "Target: $TARGET_URL"
+          echo "Depth: $DEPTH"
+          echo "Output: $OUTPUT_FILE"
+          echo "Chromium: $CHROMIUM_PATH"
+          
+          # Create archive script
           cat > archive.js << 'SCRIPTEND'
           const puppeteer = require('puppeteer');
           const { PDFDocument } = require('pdf-lib');
           const fs = require('fs');
+          const path = require('path');
 
+          // Read environment variables
           const TARGET_URL = process.env.TARGET_URL;
           const MAX_DEPTH = parseInt(process.env.DEPTH || '2');
           const OUTPUT_FILE = process.env.OUTPUT_FILE || 'archive';
-          const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
-          const MAX_PAGES = 80;
+          const CHROMIUM_PATH = process.env.CHROMIUM_PATH;
 
-          // المان‌های مزاحم برای حذف
+          console.log('Environment check:');
+          console.log('- TARGET_URL:', TARGET_URL);
+          console.log('- MAX_DEPTH:', MAX_DEPTH);
+          console.log('- OUTPUT_FILE:', OUTPUT_FILE);
+          console.log('- CHROMIUM_PATH:', CHROMIUM_PATH);
+
+          if (!TARGET_URL) {
+            console.error('❌ TARGET_URL is required');
+            process.exit(1);
+          }
+
+          if (!CHROMIUM_PATH) {
+            console.error('❌ CHROMIUM_PATH is required');
+            process.exit(1);
+          }
+
+          // Validate URL
+          let BASE_DOMAIN;
+          try {
+            BASE_DOMAIN = new URL(TARGET_URL).hostname;
+            console.log('- BASE_DOMAIN:', BASE_DOMAIN);
+          } catch(e) {
+            console.error('❌ Invalid URL:', TARGET_URL);
+            process.exit(1);
+          }
+
+          // Elements to remove
           const REMOVE_SELECTORS = [
-            '[href="#main-content"]', '[href="#content"]', '[href="#main"]',
-            '.skip-link', '.skip-to-content', '.skip-navigation',
-            '.cookie-banner', '.cookie-consent', '.cookie-notice', '.gdpr-banner',
-            '.popup', '.modal', '.overlay', '.dialog',
-            '.advertisement', '.ad-container', '.ad-banner', '.adsense',
-            '[class*="ad-"]', '[id*="google_ads"]',
-            '.social-share', '.share-buttons', '.social-links',
-            '#comments', '.comments-area', '.comment-section',
-            '.sidebar', '#sidebar', '.widget-area',
-            'nav[role="navigation"]', '.navbar', '.main-navigation',
-            '.back-to-top', '.scroll-to-top',
-            'iframe[src*="youtube"]', 'iframe[src*="facebook"]',
-            '.newsletter-popup', '.subscribe-popup',
-            '.related-posts', '.recommended'
+            '[href="#main-content"]', 
+            '[href="#content"]', 
+            '[href="#main"]',
+            '.skip-link', 
+            '.skip-to-content', 
+            '.skip-navigation',
+            '.cookie-banner', 
+            '.cookie-consent', 
+            '.cookie-notice',
+            '.popup', 
+            '.modal', 
+            '.overlay',
+            '.advertisement', 
+            '.ad-container',
+            '.social-share', 
+            '.share-buttons',
+            '#comments', 
+            '.comments-area',
+            '.sidebar', 
+            '#sidebar',
+            'nav[role="navigation"]',
+            '.back-to-top'
           ];
 
-          let BASE_DOMAIN;
           const visited = new Set();
           const pagesToVisit = [{ url: TARGET_URL, depth: 0 }];
           const pdfBuffers = [];
+          const MAX_PAGES = 80;
 
           function normalizeUrl(url, base) {
             try {
@@ -97,166 +164,258 @@ jobs:
               absolute.hash = '';
               absolute.search = '';
               return absolute.href.replace(/\/$/, '');
-            } catch { return null; }
+            } catch (e) {
+              return null;
+            }
           }
 
           async function cleanPage(page) {
-            await page.evaluate((selectors) => {
-              selectors.forEach(selector => {
-                try {
-                  document.querySelectorAll(selector).forEach(el => {
-                    if (el && el.parentNode) el.parentNode.removeChild(el);
-                  });
-                } catch(e) {}
-              });
+            try {
+              await page.evaluate((selectors) => {
+                // Remove unwanted elements
+                selectors.forEach(selector => {
+                  try {
+                    const elements = document.querySelectorAll(selector);
+                    elements.forEach(el => {
+                      if (el && el.parentNode) {
+                        el.parentNode.removeChild(el);
+                      }
+                    });
+                  } catch(e) {
+                    // Ignore selector errors
+                  }
+                });
 
-              // حذف المان‌های مخفی
-              document.querySelectorAll('*').forEach(el => {
-                const style = window.getComputedStyle(el);
-                if (style.display === 'none' || style.visibility === 'hidden') {
-                  if (el && el.parentNode) el.parentNode.removeChild(el);
-                }
-              });
+                // Remove scripts and styles
+                const scripts = document.querySelectorAll('script, style, noscript');
+                scripts.forEach(el => {
+                  if (el && el.parentNode) {
+                    el.parentNode.removeChild(el);
+                  }
+                });
 
-              // حذف script و style
-              document.querySelectorAll('script, style, noscript').forEach(el => {
-                if (el && el.parentNode) el.parentNode.removeChild(el);
-              });
-            }, selectors);
+                // Remove hidden elements
+                const allElements = document.querySelectorAll('*');
+                allElements.forEach(el => {
+                  try {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') {
+                      if (el && el.parentNode) {
+                        el.parentNode.removeChild(el);
+                      }
+                    }
+                  } catch(e) {}
+                });
+              }, selectors);
+            } catch(e) {
+              console.log('  ⚠️ Clean page warning:', e.message);
+            }
           }
 
           async function extractLinks(page) {
-            return await page.evaluate(() => {
-              const links = [];
-              document.querySelectorAll('a[href]').forEach(a => {
-                const href = a.getAttribute('href');
-                if (href && !href.startsWith('#') && !href.startsWith('javascript:') && 
-                    !href.startsWith('mailto:') && !href.startsWith('tel:') &&
-                    !href.includes('login') && !href.includes('register')) {
-                  links.push(href);
-                }
+            try {
+              return await page.evaluate(() => {
+                const links = [];
+                const anchors = document.querySelectorAll('a[href]');
+                anchors.forEach(a => {
+                  const href = a.getAttribute('href');
+                  if (href && 
+                      !href.startsWith('#') && 
+                      !href.startsWith('javascript:') && 
+                      !href.startsWith('mailto:') && 
+                      !href.startsWith('tel:') &&
+                      !href.includes('login') &&
+                      !href.includes('register')) {
+                    links.push(href);
+                  }
+                });
+                return [...new Set(links)].slice(0, 30);
               });
-              return [...new Set(links)].slice(0, 30);
-            });
+            } catch(e) {
+              return [];
+            }
           }
 
+          // Main function
           (async () => {
-            try { BASE_DOMAIN = new URL(TARGET_URL).hostname; }
-            catch(e) { console.error('❌ آدرس نامعتبر'); process.exit(1); }
-
-            console.log(`🌐 ${TARGET_URL} | عمق: ${MAX_DEPTH}`);
-            console.log('─'.repeat(50));
-
-            const browser = await puppeteer.launch({
-              executablePath: CHROMIUM_PATH,
-              headless: 'new',
-              args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-            });
-
-            let count = 0;
-
-            while (pagesToVisit.length > 0 && count < MAX_PAGES) {
-              const { url, depth } = pagesToVisit.shift();
+            try {
+              console.log('\n🚀 Launching browser...');
               
-              if (visited.has(url) || depth > MAX_DEPTH) continue;
+              const browser = await puppeteer.launch({
+                executablePath: CHROMIUM_PATH,
+                headless: 'new',
+                args: [
+                  '--no-sandbox',
+                  '--disable-setuid-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--disable-gpu',
+                  '--disable-extensions'
+                ]
+              });
+
+              console.log('✅ Browser launched successfully');
               
-              visited.add(url);
-              count++;
-              
-              console.log(`📄 [${count}] ${url.substring(0, 70)}`);
-              
-              try {
-                const page = await browser.newPage();
-                await page.setViewport({ width: 1280, height: 800 });
-                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+              let pageCount = 0;
+
+              while (pagesToVisit.length > 0 && pageCount < MAX_PAGES) {
+                const { url, depth } = pagesToVisit.shift();
                 
-                await page.goto(url, { waitUntil: 'networkidle0', timeout: 25000 });
-                await page.waitForTimeout(1000);
-
-                await cleanPage(page);
-                const title = await page.title();
+                if (visited.has(url) || depth > MAX_DEPTH) continue;
                 
-                const pdfBuffer = await page.pdf({
-                  format: 'A4',
-                  printBackground: true,
-                  margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' },
-                  displayHeaderFooter: true,
-                  headerTemplate: `<div style="font-size:7px; color:#999; text-align:center; width:100%;">${title || url}</div>`,
-                  footerTemplate: '<div style="font-size:7px; color:#999; text-align:center; width:100%;"><span class="pageNumber"></span>/<span class="totalPages"></span></div>'
-                });
+                visited.add(url);
+                pageCount++;
+                
+                console.log(`\n📄 [${pageCount}/${MAX_PAGES}] ${url.substring(0, 80)}`);
+                
+                try {
+                  const page = await browser.newPage();
+                  await page.setViewport({ width: 1280, height: 800 });
+                  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                  
+                  console.log('  Loading page...');
+                  await page.goto(url, { 
+                    waitUntil: 'networkidle0', 
+                    timeout: 30000 
+                  });
+                  
+                  console.log('  Cleaning page...');
+                  await page.waitForTimeout(1000);
+                  await cleanPage(page);
+                  
+                  const title = await page.title();
+                  console.log('  Title:', title?.substring(0, 60));
+                  
+                  console.log('  Generating PDF...');
+                  const pdfBuffer = await page.pdf({
+                    format: 'A4',
+                    printBackground: true,
+                    margin: { 
+                      top: '15mm', 
+                      bottom: '15mm', 
+                      left: '12mm', 
+                      right: '12mm' 
+                    },
+                    displayHeaderFooter: true,
+                    headerTemplate: `<div style="font-size:7px; color:#999; text-align:center; width:100%;">${title || url}</div>`,
+                    footerTemplate: '<div style="font-size:7px; color:#999; text-align:center; width:100%;"><span class="pageNumber"></span>/<span class="totalPages"></span></div>'
+                  });
 
-                pdfBuffers.push({ url, buffer: pdfBuffer, title });
-                const kb = (pdfBuffer.length/1024).toFixed(0);
-                console.log(`  ✅ ${kb} KB | ${title?.substring(0, 50)}`);
+                  pdfBuffers.push({ url, buffer: pdfBuffer, title });
+                  const kb = (pdfBuffer.length / 1024).toFixed(0);
+                  console.log(`  ✅ PDF generated: ${kb} KB`);
 
-                await page.close();
+                  await page.close();
 
-                if (depth < MAX_DEPTH) {
-                  const linkPage = await browser.newPage();
-                  try {
-                    await linkPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
-                    const links = await extractLinks(linkPage);
-                    
-                    let added = 0;
-                    for (const link of links) {
-                      const normalized = normalizeUrl(link, url);
-                      if (normalized && !visited.has(normalized) && !pagesToVisit.find(p => p.url === normalized)) {
-                        pagesToVisit.push({ url: normalized, depth: depth + 1 });
-                        added++;
+                  // Extract links for deeper crawling
+                  if (depth < MAX_DEPTH) {
+                    const linkPage = await browser.newPage();
+                    try {
+                      await linkPage.goto(url, { 
+                        waitUntil: 'domcontentloaded', 
+                        timeout: 10000 
+                      });
+                      const links = await extractLinks(linkPage);
+                      
+                      let addedCount = 0;
+                      for (const link of links) {
+                        const normalized = normalizeUrl(link, url);
+                        if (normalized && !visited.has(normalized)) {
+                          const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
+                          if (!alreadyPlanned) {
+                            pagesToVisit.push({ 
+                              url: normalized, 
+                              depth: depth + 1 
+                            });
+                            addedCount++;
+                          }
+                        }
                       }
+                      if (addedCount > 0) {
+                        console.log(`  🔗 ${addedCount} new links found`);
+                      }
+                    } catch(e) {
+                      console.log('  ⚠️ Link extraction error:', e.message);
                     }
-                    if (added) console.log(`  🔗 ${added} لینک`);
-                  } catch(e) {}
-                  await linkPage.close();
+                    await linkPage.close();
+                  }
+
+                } catch (error) {
+                  console.log(`  ❌ Error: ${error.message.substring(0, 100)}`);
                 }
-
-              } catch (error) {
-                console.log(`  ⚠️ ${error.message.substring(0, 60)}`);
               }
-            }
 
-            await browser.close();
+              await browser.close();
+              console.log('\n✅ Browser closed');
 
-            if (pdfBuffers.length === 0) {
-              console.error('❌ هیچ صفحه‌ای ذخیره نشد');
+              if (pdfBuffers.length === 0) {
+                console.error('❌ No pages were archived');
+                process.exit(1);
+              }
+
+              console.log(`\n📚 Merging ${pdfBuffers.length} PDFs...`);
+              
+              const mergedPdf = await PDFDocument.create();
+              
+              for (const { url, buffer } of pdfBuffers) {
+                try {
+                  const singlePdf = await PDFDocument.load(buffer);
+                  const pages = await mergedPdf.copyPages(
+                    singlePdf, 
+                    singlePdf.getPageIndices()
+                  );
+                  pages.forEach(page => mergedPdf.addPage(page));
+                } catch(e) {
+                  console.log(`  ⚠️ Failed to merge: ${url}`);
+                }
+              }
+
+              const finalPdf = await mergedPdf.save({ 
+                useObjectStreams: true 
+              });
+              
+              fs.writeFileSync(`${OUTPUT_FILE}.pdf`, finalPdf);
+              
+              const sizeMB = (finalPdf.length / (1024 * 1024)).toFixed(2);
+              const totalPages = mergedPdf.getPageCount();
+              
+              console.log('\n' + '='.repeat(50));
+              console.log('✅ ARCHIVE COMPLETE!');
+              console.log(`📄 Web pages: ${pdfBuffers.length}`);
+              console.log(`📑 PDF pages: ${totalPages}`);
+              console.log(`💾 Size: ${sizeMB} MB`);
+              console.log(`📁 File: ${OUTPUT_FILE}.pdf`);
+              console.log('='.repeat(50));
+
+              // Save page list
+              const pageList = pdfBuffers
+                .map((p, i) => `${i + 1}. ${p.title || p.url}`)
+                .join('\n');
+              fs.writeFileSync(`${OUTPUT_FILE}.txt`, pageList);
+              
+              console.log('✅ Process completed successfully');
+
+            } catch (error) {
+              console.error('\n❌ FATAL ERROR:', error.message);
+              console.error(error.stack);
               process.exit(1);
             }
+          })();
 
-            console.log(`\n📚 ادغام ${pdfBuffers.length} PDF...`);
-            
-            const mergedPdf = await PDFDocument.create();
-            
-            for (const { buffer } of pdfBuffers) {
-              try {
-                const pdf = await PDFDocument.load(buffer);
-                const pages = await mergedPdf.copyPages(pdf, pdf.getPageIndices());
-                pages.forEach(p => mergedPdf.addPage(p));
-              } catch(e) {}
-            }
-
-            const finalPdf = await mergedPdf.save({ useObjectStreams: true });
-            fs.writeFileSync(`${OUTPUT_FILE}.pdf`, finalPdf);
-            
-            const size = (finalPdf.length / (1024 * 1024)).toFixed(2);
-            const totalPages = mergedPdf.getPageCount();
-            
-            console.log('─'.repeat(50));
-            console.log(`✅ تمام! ${pdfBuffers.length} صفحه وب`);
-            console.log(`📄 ${totalPages} صفحه PDF | 💾 ${size} MB`);
-
-            // فهرست صفحات
-            const list = pdfBuffers.map((p, i) => `${i+1}. ${p.title || p.url}`).join('\n');
-            fs.writeFileSync(`${OUTPUT_FILE}.txt`, list);
-            
-          })().catch(err => {
-            console.error('❌ خطا:', err.message);
-            process.exit(1);
-          });
           SCRIPTEND
 
+          echo "Running archive script..."
           node archive.js
+          
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Archive script completed successfully"
+          else
+            echo "❌ Archive script failed with exit code: $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
 
       - name: 📤 Upload Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.filename }}
@@ -271,18 +430,35 @@ jobs:
           FILENAME="${{ github.event.inputs.filename }}"
           mkdir -p archives/${FILENAME}
           
-          cp ${FILENAME}.pdf archives/${FILENAME}/ 2>/dev/null || true
-          cp ${FILENAME}.txt archives/${FILENAME}/ 2>/dev/null || true
+          if [ -f "${FILENAME}.pdf" ]; then
+            cp ${FILENAME}.pdf archives/${FILENAME}/
+            echo "✅ PDF copied to archives"
+          fi
+          
+          if [ -f "${FILENAME}.txt" ]; then
+            cp ${FILENAME}.txt archives/${FILENAME}/
+            echo "✅ TXT copied to archives"
+          fi
           
           git config user.name "github-actions[bot]"
           git config user.email "actions@github.com"
           git add archives/
-          git commit -m "📚 ${FILENAME} - ${{ github.event.inputs.target_url }}" || echo "بدون تغییر"
+          git commit -m "📚 ${FILENAME} - ${TARGET_URL}" || echo "No changes to commit"
           git pull --rebase origin main
           git push origin main
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
 
       - name: ✅ Summary
+        if: always()
         run: |
-          echo "## ✅ آرشیو کامل شد" >> $GITHUB_STEP_SUMMARY
-          echo "**فایل:** ${{ github.event.inputs.filename }}.pdf" >> $GITHUB_STEP_SUMMARY
-          echo "**آدرس:** ${{ github.event.inputs.target_url }}" >> $GITHUB_STEP_SUMMARY
+          if [ -f "${{ github.event.inputs.filename }}.pdf" ]; then
+            SIZE=$(du -h "${{ github.event.inputs.filename }}.pdf" | cut -f1)
+            echo "## ✅ آرشیو با موفقیت انجام شد" >> $GITHUB_STEP_SUMMARY
+            echo "**📁 فایل:** ${{ github.event.inputs.filename }}.pdf" >> $GITHUB_STEP_SUMMARY
+            echo "**💾 حجم:** $SIZE" >> $GITHUB_STEP_SUMMARY
+            echo "**🌐 آدرس:** ${{ github.event.inputs.target_url }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ خطا در آرشیو" >> $GITHUB_STEP_SUMMARY
+            echo "لطفاً لاگ‌های مرحله قبل را بررسی کنید" >> $GITHUB_STEP_SUMMARY
+          fi
