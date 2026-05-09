@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -99,19 +101,15 @@ jobs:
           const visited = new Set();
           const pagesToVisit = [{ url: TARGET_URL, depth: 0 }];
           const pdfBuffers = [];
-          const MAX_PAGES = 30; // محدودیت معقول
+          const MAX_PAGES = 30;
 
           function normalizeUrl(url, base) {
             try {
               const absolute = new URL(url, base);
-              // فقط صفحات همون دامنه
               if (absolute.hostname !== BASE_DOMAIN) return null;
-              // حذف hash و پارامترهای تکراری
               absolute.hash = '';
-              // حذف پارامترهای tracking معمول
               const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term', 'fbclid', 'gclid'];
               trackingParams.forEach(p => absolute.searchParams.delete(p));
-              // نرمال‌سازی
               let normalized = absolute.href.replace(/\/$/, '');
               return normalized;
             } catch {
@@ -119,24 +117,23 @@ jobs:
             }
           }
 
-          function isContentPage(url, baseDomain) {
-            // فیلتر فایل‌های غیر HTML
-            const skipExtensions = ['.pdf', '.zip', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.xml', '.rss', '.ico', '.woff', '.woff2'];
+          function isContentPage(url) {
+            const skipExtensions = ['.pdf', '.zip', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.js', '.xml', '.rss', '.ico', '.woff', '.woff2', '.mp4', '.webm'];
             const urlLower = url.toLowerCase();
             if (skipExtensions.some(ext => urlLower.includes(ext))) return false;
             
-            // فیلتر صفحات لاگین، search، و صفحات خاص
             const skipPatterns = [
               '/login', '/signin', '/register', '/signup', '/search', 
               '/cart', '/checkout', '/account', '/admin', '/wp-admin',
-              '/cdn-cgi/', '/tag/', '/category/', '/author/', '/feed/'
+              '/cdn-cgi/', '/tag/', '/category/', '/author/', '/feed/',
+              '/wp-json/', '/xmlrpc'
             ];
             if (skipPatterns.some(pattern => urlLower.includes(pattern))) return false;
             
             return true;
           }
 
-          async function extractLinks(page, baseUrl) {
+          async function extractLinks(page) {
             return await page.evaluate(() => {
               const links = new Set();
               document.querySelectorAll('a[href]').forEach(a => {
@@ -185,104 +182,103 @@ jobs:
               
               if (visited.has(url)) continue;
               if (depth > MAX_DEPTH) continue;
-              if (!isContentPage(url, BASE_DOMAIN)) {
-                console.log(`⊘ رد شد (غیر محتوایی): ${url}`);
+              if (!isContentPage(url)) {
+                console.log(`⊘ رد شد: ${url}`);
                 continue;
               }
               
               visited.add(url);
               pageCount++;
               
-              const progressBar = '█'.repeat(Math.floor(pageCount/MAX_PAGES*20)) + '░'.repeat(20-Math.floor(pageCount/MAX_PAGES*20));
-              console.log(`\n${progressBar} [${pageCount}/${MAX_PAGES}] 📄 ${url}`);
+              console.log(`\n📄 [${pageCount}/${MAX_PAGES}] ${url}`);
               
               let page;
               try {
                 page = await browser.newPage();
                 
-                // تنظیم timeout طولانی‌تر
                 page.setDefaultNavigationTimeout(30000);
                 page.setDefaultTimeout(30000);
                 
                 await page.setViewport({ 
                   width: 1366, 
                   height: 768,
-                  deviceScaleFactor: 2 // کیفیت بالاتر
+                  deviceScaleFactor: 2
                 });
                 
+                // User agent فارسی/ایرانی
                 await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 
-                // بلاک کردن منابع غیرضروری برای سرعت بیشتر
+                // بلاک کردن منابع غیرضروری
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
                   const resourceType = req.resourceType();
-                  const url = req.url();
+                  const reqUrl = req.url();
                   if (resourceType === 'image' || 
                       resourceType === 'stylesheet' || 
                       resourceType === 'font' ||
                       resourceType === 'media' ||
-                      url.includes('analytics') ||
-                      url.includes('tracking') ||
-                      url.includes('doubleclick') ||
-                      url.includes('googletagmanager')) {
+                      reqUrl.includes('analytics') ||
+                      reqUrl.includes('tracking') ||
+                      reqUrl.includes('doubleclick') ||
+                      reqUrl.includes('googletagmanager') ||
+                      reqUrl.includes('google-analytics') ||
+                      reqUrl.includes('facebook')) {
                     req.abort();
                   } else {
                     req.continue();
                   }
                 });
 
-                // تلاش برای لود صفحه با مدیریت خطا
+                // لود صفحه با مدیریت خطا
                 try {
                   await page.goto(url, { 
                     waitUntil: 'networkidle0', 
                     timeout: 30000 
                   });
                 } catch (navError) {
-                  console.log(`⚠️ تلاش مجدد با waitUntil متفاوت...`);
+                  console.log(`⚠️ تلاش مجدد...`);
                   try {
                     await page.goto(url, { 
                       waitUntil: 'domcontentloaded', 
                       timeout: 30000 
                     });
                   } catch (retryError) {
-                    console.log(`⚠️ بارگذاری با محتوای موجود ادامه می‌یابد`);
+                    console.log(`⚠️ ادامه با محتوای موجود`);
                   }
                 }
 
                 // صبر برای render کامل
-                await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 1500)));
+                await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 2000)));
 
                 // حذف عناصر مزاحم
                 await page.evaluate(() => {
-                  // حذف "Skip to content" و لینک‌های مشابه
+                  // حذف "Skip to content" و موارد مشابه
                   const skipSelectors = [
-                    '.skip-link',
-                    '.skip-to-content',
-                    '.skip-to-main',
-                    '.screen-reader-text',
-                    '[class*="skip"]',
-                    '.sr-only',
-                    '.visually-hidden',
-                    '.skip-navigation',
-                    'a[href="#main"]',
-                    'a[href="#content"]',
-                    'a[href="#main-content"]',
-                    '#skiptocontent',
-                    '.skiplink'
+                    '.skip-link', '.skip-to-content', '.skip-to-main',
+                    '.screen-reader-text', '[class*="skip"]',
+                    '.sr-only', '.visually-hidden', '.skip-navigation',
+                    'a[href="#main"]', 'a[href="#content"]', 
+                    'a[href="#main-content"]', '#skiptocontent', '.skiplink',
+                    '.elementor-screen-only', '.screen-reader-shortcut'
                   ];
                   
                   skipSelectors.forEach(selector => {
                     try {
                       document.querySelectorAll(selector).forEach(el => {
-                        if (el.textContent.toLowerCase().includes('skip') || 
-                            el.textContent.toLowerCase().includes('پرش')) {
+                        const text = el.textContent.toLowerCase();
+                        if (text.includes('skip') || 
+                            text.includes('پرش') ||
+                            text.includes('رد کردن') ||
+                            text.includes('محتوای اصلی') ||
+                            el.classList.contains('skip-link') ||
+                            el.classList.contains('screen-reader-text')) {
                           el.remove();
                         }
                       });
                     } catch(e) {}
                   });
 
-                  // حذف سایر عناصر غیرضروری
+                  // حذف عناصر غیرضروری
                   const removeSelectors = [
                     'script', 'style', 'iframe', 'noscript',
                     'nav', 'header', 'footer',
@@ -295,9 +291,11 @@ jobs:
                     '.related-posts', '.recommended',
                     '.search-form', '.search-box',
                     'form[role="search"]',
-                    '.wp-block-latest-comments',
                     '#wpadminbar',
-                    '.gdpr', '.cc-banner'
+                    '.gdpr', '.cc-banner',
+                    '.newsletter', '.subscription',
+                    '.back-to-top', '.scroll-to-top',
+                    '[aria-hidden="true"]'
                   ];
                   
                   removeSelectors.forEach(selector => {
@@ -305,23 +303,9 @@ jobs:
                       document.querySelectorAll(selector).forEach(el => el.remove());
                     } catch(e) {}
                   });
-
-                  // حذف spacer ها و المان‌های خالی
-                  document.querySelectorAll('*').forEach(el => {
-                    const style = window.getComputedStyle(el);
-                    if ((el.children.length === 0 && el.textContent.trim() === '' && 
-                         !el.querySelector('img') && !el.querySelector('svg')) ||
-                        style.display === 'none' ||
-                        style.visibility === 'hidden') {
-                      // فقط عناصر کاملاً غیرضروری
-                      if (el.tagName !== 'BR' && el.tagName !== 'HR' && el.tagName !== 'INPUT') {
-                        el.remove();
-                      }
-                    }
-                  });
                 });
 
-                // تولید PDF با تنظیمات بهتر
+                // تولید PDF
                 const pdfBuffer = await page.pdf({
                   format: 'A4',
                   printBackground: true,
@@ -361,14 +345,15 @@ jobs:
                   scale: 0.9
                 });
                 
+                const pageTitle = await page.title() || url;
                 pdfBuffers.push({ 
                   url, 
                   buffer: pdfBuffer,
-                  title: await page.title() || url
+                  title: pageTitle.substring(0, 100)
                 });
                 
                 const sizeKB = (pdfBuffer.length / 1024).toFixed(1);
-                console.log(`✅ ذخیره شد | ${sizeKB} KB | ${await page.title()}`.substring(0, 100));
+                console.log(`✅ ${sizeKB} KB | ${pageTitle}`.substring(0, 120));
                 
                 await page.close();
                 page = null;
@@ -391,12 +376,12 @@ jobs:
                       timeout: 15000 
                     });
                     
-                    const links = await extractLinks(explorePage, url);
+                    const links = await extractLinks(explorePage);
                     let addedLinks = 0;
                     
                     for (const link of links) {
                       const normalized = normalizeUrl(link, url);
-                      if (normalized && !visited.has(normalized) && isContentPage(normalized, BASE_DOMAIN)) {
+                      if (normalized && !visited.has(normalized) && isContentPage(normalized)) {
                         const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
                         if (!alreadyPlanned) {
                           pagesToVisit.push({ url: normalized, depth: depth + 1 });
@@ -406,7 +391,7 @@ jobs:
                     }
                     
                     if (addedLinks > 0) {
-                      console.log(`🔗 ${addedLinks} لینک جدید به صف اضافه شد (عمق ${depth + 1})`);
+                      console.log(`🔗 +${addedLinks} لینک جدید (عمق ${depth + 1})`);
                     }
                   } catch (e) {
                     // خطا در استخراج لینک قابل چشم‌پوشی است
@@ -427,10 +412,9 @@ jobs:
             console.log(`📊 خلاصه:`);
             console.log(`   صفحات پردازش شده: ${pageCount}`);
             console.log(`   PDF‌های تولید شده: ${pdfBuffers.length}`);
-            console.log(`   عمق خزش: ${MAX_DEPTH}`);
 
             if (pdfBuffers.length === 0) {
-              console.error('❌ هیچ صفحه‌ای با موفقیت دریافت نشد!');
+              console.error('❌ هیچ صفحه‌ای دریافت نشد!');
               process.exit(1);
             }
 
@@ -446,102 +430,114 @@ jobs:
                 copiedPages.forEach(page => mergedPdf.addPage(page));
                 mergedCount++;
               } catch (error) {
-                console.log(`⚠️ خطا در ادغام PDF: ${url} - ${error.message}`);
+                console.log(`⚠️ خطا در ادغام: ${url}`);
               }
             }
 
             if (mergedCount === 0) {
-              console.error('❌ ادغام PDFها با شکست مواجه شد');
+              console.error('❌ ادغام PDFها شکست خورد');
               process.exit(1);
             }
-
-            console.log(`📝 ${mergedCount} PDF با موفقیت ادغام شدند`);
 
             // ذخیره فایل نهایی
             const pdfBytes = await mergedPdf.save();
             
-            // اطمینان از وجود پوشه خروجی
-            const outputDir = path.dirname(OUTPUT_FILE);
-            if (outputDir && outputDir !== '.') {
-              fs.mkdirSync(outputDir, { recursive: true });
-            }
-            
+            // ذخیره در ریشه ریپو
             fs.writeFileSync(OUTPUT_FILE, pdfBytes);
             
             const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(2);
             console.log(`\n${'='.repeat(50)}`);
-            console.log(`✅ فایل نهایی با موفقیت ذخیره شد`);
+            console.log(`✅ فایل نهایی ذخیره شد`);
             console.log(`📁 ${OUTPUT_FILE}`);
             console.log(`📦 حجم: ${sizeMB} MB`);
-            console.log(`📄 تعداد صفحات PDF: ${mergedPdf.getPageCount()}`);
-            
-            // خروجی برای GitHub Actions
-            console.log(`::set-output name=pdf_size::${sizeMB}`);
-            console.log(`::set-output name=page_count::${pdfBuffers.length}`);
+            console.log(`📄 صفحات PDF: ${mergedPdf.getPageCount()}`);
             
           })().catch(err => {
-            console.error('❌ خطای بحرانی:', err.message);
-            console.error(err.stack);
+            console.error('❌ خطای بحرانی:', err);
             process.exit(1);
           });
           SCRIPT_END
 
-          echo "🚀 شروع فرآیند آرشیو..."
+          echo "🚀 شروع آرشیو..."
           node archive.js
 
-      - name: Upload PDF Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ github.event.inputs.filename }}
-          path: ${{ github.event.inputs.filename }}.pdf
-          retention-days: 90
-          compression-level: 6
-
-      - name: Commit to Repository
+      - name: Commit PDF to Repository
         if: success()
         run: |
           FILENAME="${{ github.event.inputs.filename }}.pdf"
           
+          echo "📋 بررسی فایل: $FILENAME"
+          
+          # بررسی وجود فایل
           if [ ! -f "$FILENAME" ]; then
-            echo "❌ فایل PDF یافت نشد: $FILENAME"
+            echo "❌ فایل PDF یافت نشد!"
+            echo "📂 محتویات پوشه جاری:"
             ls -la
             exit 1
           fi
           
-          # ایجاد پوشه archives اگر وجود نداشته باشد
-          mkdir -p archives
+          echo "✅ فایل PDF پیدا شد"
+          ls -lh "$FILENAME"
           
-          # کپی فایل به پوشه archives
-          cp "$FILENAME" "archives/$FILENAME"
+          # نمایش محتوای پوشه
+          echo "📂 فایل‌های موجود:"
+          ls -la
           
-          # بررسی تغییرات
-          if git diff --quiet && git diff --staged --quiet; then
-            echo "✅ فایل بدون تغییر بود، کامیت جدیدی نیاز نیست"
-            exit 0
-          fi
+      - name: Push to Repository
+        if: success()
+        run: |
+          FILENAME="${{ github.event.inputs.filename }}.pdf"
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          DOMAIN=$(echo "${{ github.event.inputs.target_url }}" | sed 's|https\?://||' | sed 's|/.*||')
+          
+          echo "🔄 آماده‌سازی برای commit و push..."
           
           # تنظیم git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # اضافه کردن و کامیت
-          git add "archives/$FILENAME"
+          # ایجاد شاخه جدید برای این آرشیو
+          BRANCH_NAME="pdf-archive-${DOMAIN}-${TIMESTAMP}"
           
-          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-          git commit -m "📚 آرشیو PDF: ${{ github.event.inputs.target_url }}" -m "تاریخ: ${TIMESTAMP}" -m "عمق: ${{ github.event.inputs.depth }}" || {
-            echo "⚠️ کامیت با شکست مواجه شد یا تغییری برای کامیت وجود ندارد"
+          # ایجاد و سوییچ به شاخه جدید
+          git checkout -b "$BRANCH_NAME"
+          
+          # اضافه کردن فایل PDF
+          git add "$FILENAME"
+          
+          # نمایش وضعیت
+          echo "📊 وضعیت git:"
+          git status
+          
+          # کامیت
+          git commit -m "📚 آرشیو PDF: ${{ github.event.inputs.target_url }}" \
+                     -m "🔍 عمق: ${{ github.event.inputs.depth }}" \
+                     -m "📅 تاریخ: ${TIMESTAMP}" || {
+            echo "⚠️ خطا در commit"
             git status
           }
           
-          # Pull و Push با هندل کردن conflict
-          git pull --rebase origin main || git pull origin main
-          git push origin main || {
-            echo "⚠️ Push به مشکل خورد، تلاش مجدد..."
-            git pull --rebase origin main
-            git push origin main
-          }
+          # Push به شاخه جدید
+          echo "📤 در حال push به شاخه ${BRANCH_NAME}..."
+          git push origin "$BRANCH_NAME"
           
-          echo "✅ فایل PDF در مسیر archives/${FILENAME} ذخیره و push شد"
+          # ایجاد Pull Request (اختیاری)
+          echo "🔗 لینک دانلود مستقیم:"
+          echo "https://github.com/${{ github.repository }}/raw/${BRANCH_NAME}/${FILENAME}"
+          
+          # همچنین push به main
+          echo "🔄 در حال merge با main..."
+          git checkout main
+          git pull origin main
+          git merge "$BRANCH_NAME" --no-edit
+          git push origin main
+          
+          echo "✅ فایل PDF با موفقیت در ریپو ذخیره شد!"
+          echo ""
+          echo "📥 لینک دانلود مستقیم:"
+          echo "https://github.com/${{ github.repository }}/raw/main/${FILENAME}"
           
           # نمایش اطلاعات فایل
-          ls -lh "archives/$FILENAME"
+          echo ""
+          echo "📊 اطلاعات فایل:"
+          ls -lh "$FILENAME"
