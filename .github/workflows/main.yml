@@ -28,7 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
 
     steps:
       - name: Checkout Repository
@@ -39,209 +38,238 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            chromium-browser \
+            fonts-ipafont-gothic \
+            fonts-wqy-zenhei \
+            fonts-thai-tlwg \
+            fonts-kacst \
+            fonts-freefont-ttf \
+            --no-install-recommends || true
+
+      - name: Install npm packages
         run: |
           npm init -y
           npm install puppeteer pdf-lib
 
-      - name: Install Chromium Dependencies
+      - name: Find Chromium Path
+        id: chromium
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ca-certificates \
-            fonts-liberation \
-            libasound2 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libcups2 \
-            libdbus-1-3 \
-            libgbm1 \
-            libgtk-3-0 \
-            libnspr4 \
-            libnss3 \
-            libx11-xcb1 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxrandr2 \
-            xdg-utils
+          CHROMIUM_PATH=$(which chromium-browser || which chromium || which google-chrome || echo "/usr/bin/chromium-browser")
+          echo "path=$CHROMIUM_PATH" >> $GITHUB_OUTPUT
+          echo "Chromium found at: $CHROMIUM_PATH"
 
       - name: Archive Website to PDF
-        id: archive
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          DEPTH: ${{ github.event.inputs.depth }}
+          OUTPUT_FILE: ${{ github.event.inputs.filename }}.pdf
+          CHROMIUM_PATH: ${{ steps.chromium.outputs.path }}
         run: |
           cat > archive.js << 'SCRIPT_END'
           const puppeteer = require('puppeteer');
           const { PDFDocument } = require('pdf-lib');
           const fs = require('fs');
-          const path = require('path');
 
           const TARGET_URL = process.env.TARGET_URL;
           const MAX_DEPTH = parseInt(process.env.DEPTH || '2');
           const OUTPUT_FILE = process.env.OUTPUT_FILE || 'web-archive.pdf';
-          const BASE_DOMAIN = new URL(TARGET_URL).hostname;
+          const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium-browser';
+          
+          let BASE_DOMAIN;
+          try {
+            BASE_DOMAIN = new URL(TARGET_URL).hostname;
+          } catch(e) {
+            console.error('❌ آدرس وارد شده معتبر نیست');
+            process.exit(1);
+          }
 
           const visited = new Set();
           const pagesToVisit = [{ url: TARGET_URL, depth: 0 }];
           const pdfBuffers = [];
 
-          // نرمال‌سازی URL
           function normalizeUrl(url, base) {
             try {
               const absolute = new URL(url, base);
               if (absolute.hostname !== BASE_DOMAIN) return null;
               absolute.hash = '';
-              return absolute.href;
+              absolute.search = '';
+              return absolute.href.replace(/\/$/, '');
             } catch {
               return null;
             }
           }
 
-          // استخراج لینک‌های داخلی
           async function extractLinks(page, baseUrl) {
-            return await page.evaluate((baseDomain) => {
+            return await page.evaluate(() => {
               const links = [];
               document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.getAttribute('href');
-                if (href && !href.startsWith('#') && !href.startsWith('javascript:') && !href.startsWith('mailto:')) {
+                if (href && !href.startsWith('#') && !href.startsWith('javascript:') && 
+                    !href.startsWith('mailto:') && !href.startsWith('tel:')) {
                   links.push(href);
                 }
               });
               return links;
-            }, BASE_DOMAIN);
+            });
           }
 
-          console.log(`🚀 راه‌اندازی مرورگر...`);
-          const browser = await puppeteer.launch({
-            headless: 'new',
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-          });
+          (async () => {
+            console.log(`🚀 راه‌اندازی مرورگر از مسیر: ${CHROMIUM_PATH}`);
+            
+            const browser = await puppeteer.launch({
+              executablePath: CHROMIUM_PATH,
+              headless: 'new',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-extensions'
+              ]
+            });
 
-          let pageIndex = 0;
-          while (pagesToVisit.length > 0) {
-            const { url, depth } = pagesToVisit.shift();
-            
-            if (visited.has(url)) continue;
-            if (depth > MAX_DEPTH) continue;
-            
-            visited.add(url);
-            pageIndex++;
-            
-            console.log(`${pageIndex}. 📄 دریافت: ${url}`);
-            
-            try {
-              const page = await browser.newPage();
-              await page.setViewport({ width: 1280, height: 800 });
-              await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-              
-              await page.goto(url, { 
-                waitUntil: 'networkidle2', 
-                timeout: 30000 
-              });
-              
-              // حذف المان‌های مزاحم
-              await page.evaluate(() => {
-                const selectors = [
-                  'script', 'style', 'nav[role="navigation"]',
-                  '.sidebar', '.nav', '.menu', '.advertisement',
-                  '.cookie-banner', '.popup', '.modal'
-                ];
-                selectors.forEach(sel => {
-                  document.querySelectorAll(sel).forEach(el => el.remove());
-                });
-              });
+            let pageCount = 0;
+            const maxPages = 50; // محدودیت برای جلوگیری از timeout
 
-              // تولید PDF
-              const pdfBuffer = await page.pdf({
-                format: 'A4',
-                printBackground: true,
-                margin: { top: '20mm', bottom: '20mm', left: '15mm', right: '15mm' },
-                displayHeaderFooter: true,
-                headerTemplate: `<div style="font-size:10px; text-align:center; width:100%;">${url}</div>`,
-                footerTemplate: `<div style="font-size:10px; text-align:center; width:100%;">صفحه <span class="pageNumber"></span> از <span class="totalPages"></span></div>`
-              });
+            while (pagesToVisit.length > 0 && pageCount < maxPages) {
+              const { url, depth } = pagesToVisit.shift();
               
-              pdfBuffers.push({ url, buffer: pdfBuffer });
-              await page.close();
+              if (visited.has(url)) continue;
+              if (depth > MAX_DEPTH) continue;
               
-              // استخراج لینک‌ها برای رفتن عمیق‌تر
-              if (depth < MAX_DEPTH) {
-                const explorePage = await browser.newPage();
-                await explorePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-                const links = await extractLinks(explorePage, url);
-                await explorePage.close();
+              visited.add(url);
+              pageCount++;
+              
+              console.log(`\n📄 [${pageCount}/${maxPages}] دریافت: ${url}`);
+              
+              try {
+                const page = await browser.newPage();
+                await page.setViewport({ width: 1280, height: 800 });
+                await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
                 
-                for (const link of links) {
-                  const normalized = normalizeUrl(link, url);
-                  if (normalized && !visited.has(normalized)) {
-                    const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
-                    if (!alreadyPlanned) {
-                      pagesToVisit.push({ url: normalized, depth: depth + 1 });
+                await page.goto(url, { 
+                  waitUntil: 'networkidle0', 
+                  timeout: 25000 
+                }).catch(() => {
+                  console.log('⚠️ بارگذاری کامل صفحه ممکن نشد، ادامه با محتوای موجود...');
+                });
+
+                // کمی صبر برای لود کامل
+                await new Promise(r => setTimeout(r, 2000));
+
+                await page.evaluate(() => {
+                  const removables = 'script, style, iframe, nav, .sidebar, .menu, .nav, .advertisement, .cookie-banner, .popup, .modal, [role="navigation"]';
+                  document.querySelectorAll(removables).forEach(el => el.remove());
+                });
+
+                const pdfBuffer = await page.pdf({
+                  format: 'A4',
+                  printBackground: true,
+                  margin: { top: '15mm', bottom: '15mm', left: '10mm', right: '10mm' },
+                  displayHeaderFooter: true,
+                  headerTemplate: '<div style="font-size:8px; text-align:center; width:100%; padding:5px;">' + url.substring(0, 100) + '</div>',
+                  footerTemplate: '<div style="font-size:8px; text-align:center; width:100%;"><span class="pageNumber"></span> / <span class="totalPages"></span></div>'
+                });
+                
+                pdfBuffers.push({ url, buffer: pdfBuffer });
+                console.log(`✅ ذخیره شد (${(pdfBuffer.length/1024).toFixed(1)} KB)`);
+                
+                await page.close();
+
+                if (depth < MAX_DEPTH) {
+                  const explorePage = await browser.newPage();
+                  try {
+                    await explorePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+                    const links = await extractLinks(explorePage, url);
+                    
+                    for (const link of links) {
+                      const normalized = normalizeUrl(link, url);
+                      if (normalized && !visited.has(normalized)) {
+                        const alreadyPlanned = pagesToVisit.some(p => p.url === normalized);
+                        if (!alreadyPlanned) {
+                          pagesToVisit.push({ url: normalized, depth: depth + 1 });
+                        }
+                      }
                     }
+                    console.log(`🔗 ${links.length} لینک پیدا شد`);
+                  } catch (e) {
+                    console.log('⚠️ خطا در استخراج لینک‌ها');
                   }
+                  await explorePage.close();
                 }
+                
+              } catch (error) {
+                console.log(`❌ خطا: ${error.message.substring(0, 100)}`);
               }
-              
-            } catch (error) {
-              console.log(`⚠️ خطا در دریافت ${url}: ${error.message}`);
             }
-          }
 
-          await browser.close();
+            await browser.close();
+            console.log(`\n📊 مجموع صفحات دریافت شده: ${pdfBuffers.length}`);
 
-          // ادغام PDFها
-          console.log(`\n📚 ادغام ${pdfBuffers.length} صفحه در یک فایل PDF...`);
-          const mergedPdf = await PDFDocument.create();
+            if (pdfBuffers.length === 0) {
+              console.error('❌ هیچ صفحه‌ای دریافت نشد!');
+              process.exit(1);
+            }
 
-          for (const { url, buffer } of pdfBuffers) {
-            try {
-              const singlePdf = await PDFDocument.load(buffer);
-              const pages = await mergedPdf.copyPages(singlePdf, singlePdf.getPageIndices());
-              
-              // اضافه کردن صفحه فهرست
-              if (pdfBuffers.indexOf({url, buffer}) === 0 || true) {
-                pages.forEach(page => mergedPdf.addPage(page));
+            console.log('📚 در حال ادغام PDFها...');
+            const mergedPdf = await PDFDocument.create();
+
+            for (const { url, buffer } of pdfBuffers) {
+              try {
+                const singlePdf = await PDFDocument.load(buffer);
+                const copiedPages = await mergedPdf.copyPages(singlePdf, singlePdf.getPageIndices());
+                copiedPages.forEach(page => mergedPdf.addPage(page));
+              } catch (error) {
+                console.log(`⚠️ خطا در ادغام: ${url}`);
               }
-            } catch (error) {
-              console.log(`⚠️ خطا در اضافه کردن ${url} به PDF نهایی`);
             }
-          }
 
-          // اضافه کردن بوکمارک
-          const pdfBytes = await mergedPdf.save();
-          fs.writeFileSync(OUTPUT_FILE, pdfBytes);
-          
-          const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(2);
-          console.log(`\n✅ آرشیو کامل شد: ${OUTPUT_FILE} (${sizeMB} MB)`);
-          console.log(`📊 مجموع صفحات آرشیو شده: ${visited.size}`);
+            const pdfBytes = await mergedPdf.save();
+            fs.writeFileSync(OUTPUT_FILE, pdfBytes);
+            
+            const sizeMB = (pdfBytes.length / (1024 * 1024)).toFixed(2);
+            console.log(`\n✅ فایل نهایی: ${OUTPUT_FILE}`);
+            console.log(`📦 حجم: ${sizeMB} MB`);
+            console.log(`📄 صفحات: ${pdfBuffers.length}`);
+          })().catch(err => {
+            console.error('❌ خطای کلی:', err);
+            process.exit(1);
+          });
           SCRIPT_END
 
+          echo "شروع آرشیو..."
           node archive.js
-        env:
-          TARGET_URL: ${{ github.event.inputs.target_url }}
-          DEPTH: ${{ github.event.inputs.depth }}
-          OUTPUT_FILE: ${{ github.event.inputs.filename }}.pdf
 
-      - name: Upload PDF as Artifact
+      - name: Upload PDF Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: website-pdf-archive
+          name: ${{ github.event.inputs.filename }}
           path: ${{ github.event.inputs.filename }}.pdf
           retention-days: 90
 
-      - name: Commit PDF to Repository
+      - name: Commit to Repository
+        if: success()
         run: |
           FILENAME="${{ github.event.inputs.filename }}.pdf"
           
-          if [ -f "$FILENAME" ]; then
-            cp "$FILENAME" archives/
-            git config user.name "github-actions[bot]"
-            git config user.email "actions@github.com"
-            git add archives/
-            git commit -m "📚 آرشیو PDF: ${{ github.event.inputs.target_url }}"
-            git pull --rebase origin main
-            git push origin main
-            
-            echo "📂 فایل در مسیر archives/$FILENAME ذخیره شد"
-          else
-            echo "❌ فایل PDF ایجاد نشد"
+          if [ ! -f "$FILENAME" ]; then
+            echo "❌ فایل PDF یافت نشد"
             exit 1
           fi
+          
+          mkdir -p archives
+          cp "$FILENAME" "archives/$FILENAME"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add "archives/$FILENAME"
+          
+          git commit -m "📚 ذخیره PDF: ${{ github.event.inputs.target_url }} ($(date +%Y-%m-%d_%H:%M))" || echo "بدون تغییر جدید"
+          git pull --rebase origin main
+          git push origin main
+          
+          echo "✅ فایل در archives/$FILENAME ذخیره شد"
